@@ -216,7 +216,15 @@ make_skew_cosh <- function(X=NULL, y=NULL, center, Sigma, radius_sq, log_post,
     X <- as.matrix(X); n <- nrow(X)
   }
   if (is.null(score)) {
-    score <- as.numeric(crossprod(X,y-plogis(X %*% center+offset)))+prior_terms$gradient(center)
+  if (is.null(prior_terms)) {
+    stop(
+      "Supply 'score' or specify a supported 'prior' for the logistic model.",
+      call. = FALSE
+    )
+  }
+
+  score <- as.numeric(crossprod(X, y - plogis(X %*% center + offset))) +
+    prior_terms$gradient(center)
   }
   score <- as.numeric(score)
   cutoff_radius_sq <- radius_sq
@@ -230,6 +238,12 @@ make_skew_cosh <- function(X=NULL, y=NULL, center, Sigma, radius_sq, log_post,
   }
   radius <- sqrt(radius_sq)
   auto_variance <- identical(proposal_variance,"auto")
+  if (!auto_variance &&
+    (!is.numeric(proposal_variance) || length(proposal_variance) != 1L ||
+     !is.finite(proposal_variance) || proposal_variance < 1)) {
+  stop("'proposal_variance' must be 'auto' or a finite number >= 1.",
+       call. = FALSE)
+  }
   if (generic_likelihood) rotate <- FALSE
   L <- t(chol(Sigma))
   B <- X %*% L
@@ -288,6 +302,12 @@ make_skew_cosh <- function(X=NULL, y=NULL, center, Sigma, radius_sq, log_post,
       }
     }
     raw_bound <- if (quadratic_prior) 0 else prior_remainder_bound
+    if (is.null(raw_bound)) {
+      stop(
+        "Supply 'prior_remainder_bound' for a custom non-quadratic prior.",
+        call. = FALSE
+      )
+    }
     if (!is.null(log_prior)) {
       prior_remainder <- function(z) {
         h <- as.numeric(L %*% z)
@@ -504,8 +524,24 @@ sample_skew_cosh_rejection <- function(N_keep,model,max_evals_per_draw=50000L,
   for (k in seq_len(N_keep)) {
     t0 <- proc.time()[["elapsed"]]; ne <- 0L
     repeat {
-      if (ne>=max_evals_per_draw || proc.time()[["elapsed"]]-t0>max_seconds_per_draw)
-        stop(sprintf("Rejection budget reached at draw %d.",k))
+      elapsed_draw <- proc.time()[["elapsed"]] - t0
+      eval_limit <- ne >= max_evals_per_draw
+      time_limit <- elapsed_draw > max_seconds_per_draw
+
+      if (eval_limit || time_limit) {
+        limits_reached <- c(
+          if (eval_limit) "proposal limit",
+          if (time_limit) "time limit"
+        )
+
+        message <- sprintf(
+          "Rejection budget reached at draw %d (%s). Proposals: %d/%d. Elapsed: %.3f/%.3f seconds.",
+          k, paste(limits_reached, collapse = " and "),
+          ne, max_evals_per_draw, elapsed_draw, max_seconds_per_draw
+        )
+
+        stop(errorCondition(message, class = "skew_cosh_budget_error"))
+      }
       x <- draw_candidate(model)
       ne <- ne+1L
       if (log(runif(1))<=x$log_accept) break

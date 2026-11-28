@@ -30,17 +30,22 @@ logiw_laplace <- function(sim, m, Cov, log_post, ...) {
 
 logiw_skew_laplace <- function(sim_skew, w_at_sim_skew, m, Cov, log_post, ...) {
   logpi <- apply(sim_skew, 1, function(z) log_post(z, ...))
-  logq  <- log(2) + log_phi_lap(sim_skew, m, Cov) + log(w_at_sim_skew)
-  logpi - logq
+  logpi_ref <- apply(sim_skew, 1, function(z) log_post(2 * m - z, ...))
+  log_phi <- log_phi_lap(sim_skew, m, Cov)
+
+  log_sum_pair <- pmax(logpi, logpi_ref) +
+    log1p(exp(-abs(logpi - logpi_ref)))
+
+  log_sum_pair - log(2) - log_phi
 }
 
 logiw_skew_cosh <- function(sim_cosh, m, Cov, log_post, logP_theta, ...) {
-  logpi <- apply(sim_cosh, 1, function(z) log_post(z, ...))
-  logP  <- apply(sim_cosh, 1, function(z) logP_theta(z, center = m))
-  wj    <- apply(sim_cosh, 1, function(z) w_joint(z, m, log_post, ...))
-  
-  logq_unnorm <- log(2) + log_phi_lap(sim_cosh, m, Cov) + logP + log(wj)
-  logpi - logq_unnorm
+  logw_skew <- logiw_skew_laplace(
+    sim_skew = sim_cosh, m = m, Cov = Cov, log_post = log_post, ...
+  )
+  logP <- apply(sim_cosh, 1, function(z) logP_theta(z, center = m))
+
+  logw_skew - logP
 }
 
 ess_from_logweights <- function(logw) {
@@ -63,48 +68,96 @@ multiple_ess_compare <- function(nsim,
                                  model,
                                  max_evals_per_draw = 50000L,
                                  max_seconds_per_draw = 120,
-                                 ...) {
+                                 ...,
+                                 progress_file = NULL) {
   ess_abs_lap <- ess_abs_skewlap <- ess_abs_cosh <- rep(NA_real_, nsim)
+  error_method <- error_message <- rep(NA_character_, nsim)
 
   logP_for_weights <- function(theta, ...) {
     logP_theta(theta, center = m, Sigma = Cov, radius_sq = radius_sq)
   }
 
+  k <- 0L
+  on.exit({
+    if (!is.null(progress_file) && any(!is.na(error_message))) {
+      reps <- seq_len(k)
+      partial_ess <- data.frame(
+        repetition = reps,
+        seed = 1000 + reps,
+        ess_abs_lap = ess_abs_lap[reps],
+        ess_abs_skewlap = ess_abs_skewlap[reps],
+        ess_abs_cosh = ess_abs_cosh[reps],
+        error_method = error_method[reps],
+        error_message = error_message[reps]
+      )
+
+      tryCatch(
+        write.csv(partial_ess, progress_file, row.names = FALSE),
+        error = function(e) {
+          message("Impossible to save partial ESS: ",
+                  conditionMessage(e))
+        }
+      )
+    }
+  }, add = TRUE)
+
   for (k in seq_len(nsim)) {
-    set.seed(1000 + k)
+    method <- "lap"
 
-    # Gaussian Laplace.
-    sim_lap <- mvtnorm::rmvnorm(N, mean = m, sigma = Cov)
-    logiw_lap <- logiw_laplace(
-      sim = sim_lap, m = m, Cov = Cov, log_post = log_post, ...
-    )
-    ess_abs_lap[k] <- ess_from_logweights(logiw_lap)
+    completed <- tryCatch({
+      set.seed(1000 + k)
 
-    # Skew-symmetric Laplace, using the same Gaussian draws.
-    w0 <- apply(sim_lap, 1, function(z) w_joint(z, m, log_post, ...))
-    skew_obj <- sim_skew(sim_lap, m, w0)
-    logiw_skewlap <- logiw_skew_laplace(
-      sim_skew = skew_obj$sim,
-      w_at_sim_skew = skew_obj$weights,
-      m = m, Cov = Cov, log_post = log_post, ...
-    )
-    ess_abs_skewlap[k] <- ess_from_logweights(logiw_skewlap)
+      # Gaussian Laplace.
+      sim_lap <- mvtnorm::rmvnorm(N, mean = m, sigma = Cov)
+      logiw_lap <- logiw_laplace(
+        sim = sim_lap, m = m, Cov = Cov, log_post = log_post, ...
+      )
+      ess_abs_lap[k] <- ess_from_logweights(logiw_lap)
 
-    # Skew-cosh Laplace.
-    cosh_obj <- sample_skew_cosh_rejection(
-      N_keep = N, model = model,
-      max_evals_per_draw = max_evals_per_draw,
-      max_seconds_per_draw = max_seconds_per_draw,
-      verbose = FALSE
-    )
-    logiw_cosh <- logiw_skew_cosh(
-      sim_cosh = cosh_obj$sim_skew, m = m, Cov = Cov,
-      log_post = log_post, logP_theta = logP_for_weights, ...
-    )
-    ess_abs_cosh[k] <- ess_from_logweights(logiw_cosh)
+      # Skew-symmetric Laplace, using the same Gaussian draws.
+      method <- "skewlap"
+      w0 <- apply(sim_lap, 1, function(z) w_joint(z, m, log_post, ...))
+      skew_obj <- sim_skew(sim_lap, m, w0)
+      logiw_skewlap <- logiw_skew_laplace(
+        sim_skew = skew_obj$sim,
+        w_at_sim_skew = skew_obj$weights,
+        m = m, Cov = Cov, log_post = log_post, ...
+      )
+      ess_abs_skewlap[k] <- ess_from_logweights(logiw_skewlap)
 
-    if (debug && (length(debug_iter) == 0L || k %in% debug_iter)) {
-      message(sprintf("Ripetizione %d/%d completata.", k, nsim))
+      # Skew-cosh Laplace.
+      method <- "cosh"
+      cosh_obj <- sample_skew_cosh_rejection(
+        N_keep = N, model = model,
+        max_evals_per_draw = max_evals_per_draw,
+        max_seconds_per_draw = max_seconds_per_draw,
+        verbose = FALSE
+      )
+      logiw_cosh <- logiw_skew_cosh(
+        sim_cosh = cosh_obj$sim_skew, m = m, Cov = Cov,
+        log_post = log_post, logP_theta = logP_for_weights, ...
+      )
+      ess_abs_cosh[k] <- ess_from_logweights(logiw_cosh)
+
+      TRUE
+    }, 
+    #Function to handle errors during the ESS computation for each method
+    error = function(e) {
+      msg <- conditionMessage(e)
+      error_method[k] <<- method
+      error_message[k] <<- msg
+
+      if (!inherits(e, "skew_cosh_budget_error")) stop(e)
+
+      message(sprintf(
+        "Repetition %d/%d, seed %d, skew-cosh: %s",
+        k, nsim, 1000 + k, msg
+      ))
+      FALSE
+    })
+
+    if (completed && debug && (length(debug_iter) == 0L || k %in% debug_iter)) {
+      message(sprintf("Repetition %d/%d completed.", k, nsim))
     }
   }
 
